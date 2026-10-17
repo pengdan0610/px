@@ -2,7 +2,7 @@
  * 🚀 Daniel's All-in-One Gateway:
  * - 前端展示与交互：100% 还原截图交互（节点协议/传输协议/指纹/ALPN 全支持点击下拉选择与保存）
  * - 云端持久化：点击保存自动存入 Cloudflare KV 数据库，全平台所有设备客户端订阅自动无缝匹配生效！
- * - 后端核心引擎：三网实测优选 IP 自动同步 + 全地区 ProxyIP 自动对齐绑定 + 单 Worker/pages 统一部署
+ * - 后端核心引擎：三网实测优选 IP 自动同步 + 全地区 ProxyIP 自动对齐绑定 + 单 Worker 统一部署
  */
 
 import { connect } from 'cloudflare:sockets';
@@ -88,10 +88,51 @@ export default {
 
       // 3. 配置读写 API /api/config -> 存入或读取 Cloudflare KV 命名空间
       if (url.pathname === '/api/config') {
+        if (!checkAuth(request, env)) {
+          return new Response(JSON.stringify({ success: false, error: '未授权：请先登录管理员账户' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+        }
         return await handleConfigApi(request, env);
       }
 
-      // 4. 默认根目录 -> 展现截图同款可交互 Web 控制面板
+      // 4. 退出登录
+      if (url.pathname === '/logout') {
+        return new Response('已退出登录', {
+          status: 302,
+          headers: {
+            'Location': '/login',
+            'Set-Cookie': 'auth=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax'
+          }
+        });
+      }
+
+      // 5. 登录处理
+      if (url.pathname === '/login') {
+        return await handleLogin(request, env, url);
+      }
+
+      // 6. 默认根目录 -> 鉴权通过展现 Web 控制面板，未授权展现登录页
+      const adminPwd = env.ADMIN || env.PASSWORD || env.KEY;
+      if (adminPwd) {
+        // 如果携带了快速直达 key，自动种植 Cookie 并重定向去除 URL 敏感参数
+        const urlKey = url.searchParams.get('key') || url.searchParams.get('pwd') || url.searchParams.get('admin');
+        if (urlKey && urlKey === adminPwd) {
+          url.searchParams.delete('key');
+          url.searchParams.delete('pwd');
+          url.searchParams.delete('admin');
+          return new Response('登录成功，跳转中...', {
+            status: 302,
+            headers: {
+              'Location': url.pathname + (url.search ? url.search : ''),
+              'Set-Cookie': `auth=${btoa(adminPwd)}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax`
+            }
+          });
+        }
+
+        if (!checkAuth(request, env)) {
+          return await handleLogin(request, env, url);
+        }
+      }
+
       return await handleShowcasePage(request, env, url);
     } catch (err) {
       return new Response(
@@ -105,6 +146,185 @@ export default {
     }
   }
 };
+
+/**
+ * 身份鉴权验证
+ */
+function checkAuth(request, env) {
+  const adminPwd = env.ADMIN || env.PASSWORD || env.KEY;
+  if (!adminPwd) return true; // 未配置密码则允许直通访问
+
+  const cookies = request.headers.get('Cookie') || '';
+  const authCookie = cookies.split(';').map(c => c.trim()).find(c => c.startsWith('auth='));
+  if (authCookie) {
+    const val = authCookie.split('=')[1];
+    if (val === btoa(adminPwd)) return true;
+  }
+  return false;
+}
+
+/**
+ * 登录界面与验证处理
+ */
+async function handleLogin(request, env, url) {
+  const adminPwd = env.ADMIN || env.PASSWORD || env.KEY;
+  if (!adminPwd) {
+    return new Response('重定向中...', { status: 302, headers: { 'Location': '/' } });
+  }
+
+  if (request.method === 'POST') {
+    let inputPwd = '';
+    const contentType = request.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      const data = await request.json().catch(() => ({}));
+      inputPwd = data.password || '';
+    } else {
+      const formData = await request.text();
+      const params = new URLSearchParams(formData);
+      inputPwd = params.get('password') || '';
+    }
+
+    if (inputPwd === adminPwd) {
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Set-Cookie': `auth=${btoa(adminPwd)}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax`
+        }
+      });
+    } else {
+      return new Response(JSON.stringify({ success: false, error: '密码错误，请重新输入' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+  }
+
+  const loginHtml = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>管理员登录 - Daniel Gateway</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0d1117;
+      color: #c9d1d9;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 1.5rem;
+    }
+    .card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 2.5rem 2rem;
+      width: 100%;
+      max-width: 400px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+      text-align: center;
+    }
+    .card h2 { color: #58a6ff; margin-bottom: 0.5rem; font-size: 1.5rem; }
+    .card p { color: #8b949e; font-size: 0.88rem; margin-bottom: 1.8rem; }
+    .form-group { margin-bottom: 1.2rem; text-align: left; }
+    .form-group label { display: block; font-size: 0.85rem; margin-bottom: 0.4rem; color: #8b949e; }
+    .form-control {
+      width: 100%;
+      padding: 0.75rem 1rem;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      color: #fff;
+      font-size: 0.95rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .form-control:focus { border-color: #58a6ff; }
+    .btn {
+      width: 100%;
+      padding: 0.75rem;
+      background: #238636;
+      border: 1px solid rgba(240,246,252,0.1);
+      border-radius: 6px;
+      color: #fff;
+      font-weight: 600;
+      font-size: 0.95rem;
+      cursor: pointer;
+      transition: background 0.2s;
+      margin-top: 0.5rem;
+    }
+    .btn:hover { background: #2ea043; }
+    .error-msg {
+      color: #f85149;
+      background: rgba(248,81,73,0.1);
+      border: 1px solid rgba(248,81,73,0.4);
+      padding: 0.6rem;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      margin-bottom: 1.2rem;
+      display: none;
+    }
+    .tip { margin-top: 1.5rem; font-size: 0.78rem; color: #6e7681; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>🔒 管理员验证</h2>
+    <p>请输入管理员密码以管理节点与订阅配置</p>
+    <div id="errMsg" class="error-msg"></div>
+    <form id="loginForm" onsubmit="doLogin(event)">
+      <div class="form-group">
+        <label for="pwd">管理密码</label>
+        <input type="password" id="pwd" class="form-control" placeholder="请输入 ADMIN / PASSWORD" required autofocus>
+      </div>
+      <button type="submit" class="btn" id="subBtn">登 录</button>
+    </form>
+    <div class="tip">💡 提示：也可以使用 <code>?key=密码</code> 直链免密进入</div>
+  </div>
+  <script>
+    async function doLogin(e) {
+      e.preventDefault();
+      const pwd = document.getElementById('pwd').value;
+      const btn = document.getElementById('subBtn');
+      const err = document.getElementById('errMsg');
+      err.style.display = 'none';
+      btn.disabled = true;
+      btn.innerText = '验证中...';
+      try {
+        const resp = await fetch('/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: pwd })
+        });
+        const res = await resp.json();
+        if (res.success) {
+          window.location.href = '/';
+        } else {
+          err.innerText = res.error || '密码错误';
+          err.style.display = 'block';
+          btn.disabled = false;
+          btn.innerText = '登 录';
+        }
+      } catch (e) {
+        err.innerText = '网络连接异常，请重试';
+        err.style.display = 'block';
+        btn.disabled = false;
+        btn.innerText = '登 录';
+      }
+    }
+  </script>
+</body>
+</html>`;
+
+  return new Response(loginHtml, {
+    status: 200,
+    headers: { 'Content-Type': 'text/html; charset=utf-8' }
+  });
+}
 
 /**
  * 处理 KV 配置存储与读取接口
