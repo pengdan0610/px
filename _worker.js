@@ -2,7 +2,7 @@
  * 🚀 Daniel's All-in-One Gateway:
  * - 前端展示与交互：100% 还原截图交互（节点协议/传输协议/指纹/ALPN 全支持点击下拉选择与保存）
  * - 云端持久化：点击保存自动存入 Cloudflare KV 数据库，全平台所有设备客户端订阅自动无缝匹配生效！
- * - 后端核心引擎：三网实测优选 IP 自动同步 + 全地区 ProxyIP 自动对齐绑定 + 单 Worker 统一部署
+ * - 后端核心引擎：三网实测优选 IP 自动同步 + 全地区 ProxyIP 自动对齐绑定 + 单 Worker/pages 统一部署
  */
 
 import { connect } from 'cloudflare:sockets';
