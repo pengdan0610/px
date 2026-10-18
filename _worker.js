@@ -88,7 +88,7 @@ export default {
 
       // 3. 配置读写 API /api/config -> 存入或读取 Cloudflare KV 命名空间
       if (url.pathname === '/api/config') {
-        if (!checkAuth(request, env)) {
+        if (!(await checkAuth(request, env))) {
           return new Response(JSON.stringify({ success: false, error: '未授权：请先登录管理员账户' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
         }
         return await handleConfigApi(request, env);
@@ -100,22 +100,28 @@ export default {
           status: 302,
           headers: {
             'Location': '/login',
-            'Set-Cookie': 'auth=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax'
+            'Set-Cookie': 'auth=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax'
           }
         });
       }
 
-      // 5. 登录处理
+      // 5. 自动初始化 KV 默认配置（确保用户控制台不再是空的）
+      if (env.KV && ctx && ctx.waitUntil) {
+        ctx.waitUntil(autoInitKV(env));
+      }
+
+      // 6. 登录处理
       if (url.pathname === '/login') {
         return await handleLogin(request, env, url);
       }
 
-      // 6. 默认根目录 -> 鉴权通过展现 Web 控制面板，未授权展现登录页
-      const adminPwd = env.ADMIN || env.PASSWORD || env.KEY;
+      // 7. 默认根目录 -> 鉴权通过展现 Web 控制面板，未授权展现登录页
+      const adminPwd = (env.ADMIN || env.PASSWORD || env.KEY || '').trim();
       if (adminPwd) {
         // 如果携带了快速直达 key，自动种植 Cookie 并重定向去除 URL 敏感参数
         const urlKey = url.searchParams.get('key') || url.searchParams.get('pwd') || url.searchParams.get('admin');
-        if (urlKey && urlKey === adminPwd) {
+        if (urlKey && urlKey.trim() === adminPwd) {
+          const token = await getAuthToken(adminPwd);
           url.searchParams.delete('key');
           url.searchParams.delete('pwd');
           url.searchParams.delete('admin');
@@ -123,12 +129,12 @@ export default {
             status: 302,
             headers: {
               'Location': url.pathname + (url.search ? url.search : ''),
-              'Set-Cookie': `auth=${btoa(adminPwd)}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax`
+              'Set-Cookie': `auth=${token}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax`
             }
           });
         }
 
-        if (!checkAuth(request, env)) {
+        if (!(await checkAuth(request, env))) {
           return await handleLogin(request, env, url);
         }
       }
@@ -148,18 +154,60 @@ export default {
 };
 
 /**
- * 身份鉴权验证
+ * 自动初始化 KV 存储，避免初次部署时 KV 为空
  */
-function checkAuth(request, env) {
-  const adminPwd = env.ADMIN || env.PASSWORD || env.KEY;
+async function autoInitKV(env) {
+  try {
+    const raw = await env.KV.get('user_config');
+    if (!raw) {
+      const initConfig = {
+        protocol: 'vless',
+        network: 'ws',
+        fingerprint: 'chrome',
+        alpn: 'h2,http/1.1',
+        insecure: true,
+        uuid: env.UUID || DEFAULT_UUID,
+        proxyip: env.PROXYIP || 'auto',
+        init_time: new Date().toISOString()
+      };
+      await env.KV.put('user_config', JSON.stringify(initConfig, null, 2));
+    }
+  } catch (e) {
+    console.warn('Auto init KV failed:', e);
+  }
+}
+
+/**
+ * 计算哈希 Token
+ */
+async function getAuthToken(pwd) {
+  const enc = new TextEncoder().encode('auth_seed_' + pwd.trim());
+  const hash = await crypto.subtle.digest('SHA-256', enc);
+  return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * 身份鉴权验证（支持 Cookie / URL Key / Bearer Token 三重保障）
+ */
+async function checkAuth(request, env) {
+  const adminPwd = (env.ADMIN || env.PASSWORD || env.KEY || '').trim();
   if (!adminPwd) return true; // 未配置密码则允许直通访问
 
+  const url = new URL(request.url);
+  const urlKey = url.searchParams.get('key') || url.searchParams.get('pwd') || url.searchParams.get('admin');
+  if (urlKey && urlKey.trim() === adminPwd) return true;
+
+  const expectedToken = await getAuthToken(adminPwd);
+
+  // 1. 检查 Cookie
   const cookies = request.headers.get('Cookie') || '';
-  const authCookie = cookies.split(';').map(c => c.trim()).find(c => c.startsWith('auth='));
-  if (authCookie) {
-    const val = authCookie.split('=')[1];
-    if (val === btoa(adminPwd)) return true;
-  }
+  const match = cookies.match(/(?:^|;\s*)auth=([a-zA-Z0-9]+)/);
+  if (match && match[1] === expectedToken) return true;
+
+  // 2. 检查 Authorization Header
+  const authHeader = request.headers.get('Authorization') || '';
+  if (authHeader.startsWith('Bearer ') && authHeader.slice(7).trim() === expectedToken) return true;
+
   return false;
 }
 
@@ -167,7 +215,7 @@ function checkAuth(request, env) {
  * 登录界面与验证处理
  */
 async function handleLogin(request, env, url) {
-  const adminPwd = env.ADMIN || env.PASSWORD || env.KEY;
+  const adminPwd = (env.ADMIN || env.PASSWORD || env.KEY || '').trim();
   if (!adminPwd) {
     return new Response('重定向中...', { status: 302, headers: { 'Location': '/' } });
   }
@@ -177,23 +225,35 @@ async function handleLogin(request, env, url) {
     const contentType = request.headers.get('content-type') || '';
     if (contentType.includes('application/json')) {
       const data = await request.json().catch(() => ({}));
-      inputPwd = data.password || '';
+      inputPwd = (data.password || '').trim();
     } else {
       const formData = await request.text();
       const params = new URLSearchParams(formData);
-      inputPwd = params.get('password') || '';
+      inputPwd = (params.get('password') || '').trim();
     }
 
     if (inputPwd === adminPwd) {
-      return new Response(JSON.stringify({ success: true }), {
+      const token = await getAuthToken(adminPwd);
+      // 如果是原生 HTML 表单 POST 提交，直接 302 带着 Cookie 跳转，100% 成功无刷新问题
+      if (!contentType.includes('application/json')) {
+        return new Response('登录成功', {
+          status: 302,
+          headers: {
+            'Location': '/',
+            'Set-Cookie': `auth=${token}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax`
+          }
+        });
+      }
+
+      return new Response(JSON.stringify({ success: true, token }), {
         status: 200,
         headers: {
           'Content-Type': 'application/json',
-          'Set-Cookie': `auth=${btoa(adminPwd)}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax`
+          'Set-Cookie': `auth=${token}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Lax`
         }
       });
     } else {
-      return new Response(JSON.stringify({ success: false, error: '密码错误，请重新输入' }), {
+      return new Response(JSON.stringify({ success: false, error: '密码错误，请检查环境变量 ADMIN 设置' }), {
         status: 401,
         headers: { 'Content-Type': 'application/json' }
       });
@@ -276,47 +336,15 @@ async function handleLogin(request, env, url) {
     <h2>🔒 管理员验证</h2>
     <p>请输入管理员密码以管理节点与订阅配置</p>
     <div id="errMsg" class="error-msg"></div>
-    <form id="loginForm" onsubmit="doLogin(event)">
+    <form id="loginForm" method="POST" action="/login">
       <div class="form-group">
         <label for="pwd">管理密码</label>
-        <input type="password" id="pwd" class="form-control" placeholder="请输入 ADMIN / PASSWORD" required autofocus>
+        <input type="password" id="pwd" name="password" class="form-control" placeholder="请输入环境变量设置的 ADMIN 密码" required autofocus>
       </div>
       <button type="submit" class="btn" id="subBtn">登 录</button>
     </form>
-    <div class="tip">💡 提示：也可以使用 <code>?key=密码</code> 直链免密进入</div>
+    <div class="tip">💡 提示：也可以在域名后加 <code>?key=密码</code> 一键免密直进</div>
   </div>
-  <script>
-    async function doLogin(e) {
-      e.preventDefault();
-      const pwd = document.getElementById('pwd').value;
-      const btn = document.getElementById('subBtn');
-      const err = document.getElementById('errMsg');
-      err.style.display = 'none';
-      btn.disabled = true;
-      btn.innerText = '验证中...';
-      try {
-        const resp = await fetch('/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ password: pwd })
-        });
-        const res = await resp.json();
-        if (res.success) {
-          window.location.href = '/';
-        } else {
-          err.innerText = res.error || '密码错误';
-          err.style.display = 'block';
-          btn.disabled = false;
-          btn.innerText = '登 录';
-        }
-      } catch (e) {
-        err.innerText = '网络连接异常，请重试';
-        err.style.display = 'block';
-        btn.disabled = false;
-        btn.innerText = '登 录';
-      }
-    }
-  </script>
 </body>
 </html>`;
 
